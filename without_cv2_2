@@ -1,0 +1,89 @@
+import argparse
+from pathlib import Path
+from PIL import Image, ImageDraw
+import json
+import numpy as np
+from facenet_pytorch import MTCNN
+import torch
+from tqdm import tqdm
+
+def run(img_dir: str, out_dir: str = "faces", device: str = None, min_face: int = 20):
+    p_img = Path(img_dir)
+    p_out = Path(out_dir)
+    p_faces = p_out / "crops"
+    p_vis = p_out / "visualizations"
+    p_faces.mkdir(parents=True, exist_ok=True)
+    p_vis.mkdir(parents=True, exist_ok=True)
+    coords = {}
+    stats = {"areas": [], "ratios": [], "scores": []}
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    mt = MTCNN(keep_all=True, device=device)
+    imgs = sorted([p for p in p_img.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp", ".tiff")])
+    for img_path in tqdm(imgs, desc="images"):
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception:
+            continue
+        boxes, probs = mt.detect(img)
+        recs = []
+        vis = img.copy()
+        draw = ImageDraw.Draw(vis)
+        if boxes is None:
+            coords[str(img_path.name)] = []
+            vis.save(p_vis / img_path.name)
+            continue
+        boxes_np = np.array(boxes, dtype=np.int32)
+        for i, (b, p) in enumerate(zip(boxes_np, probs)):
+            x1, y1, x2, y2 = b
+            w, h = x2 - x1, y2 - y1
+            if w < min_face or h < min_face:
+                continue
+            arr = np.array([x1, y1, x2, y2])
+            cx, cy = (arr[0] + arr[2]) / 2, (arr[1] + arr[3]) / 2
+            area = w * h
+            ratio = w / h if h > 0 else 0
+            crop = img.crop((x1, y1, x2, y2))
+            fname = f"{img_path.stem}_face{i+1}{img_path.suffix}"
+            crop.save(p_faces / fname)
+            recs.append({
+                "file": fname,
+                "box": arr.tolist(),
+                "score": float(p),
+                "center": [float(cx), float(cy)],
+                "area": int(area),
+                "ratio": float(ratio)
+            })
+            stats["areas"].append(area)
+            stats["ratios"].append(ratio)
+            stats["scores"].append(float(p))
+            draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+            draw.text((x1, y1 - 10), f"{p:.2f}", fill="red")
+        coords[str(img_path.name)] = recs
+        vis.save(p_vis / img_path.name)
+    report = {}
+    if stats["areas"]:
+        arr_a, arr_r, arr_s = map(np.array, [stats["areas"], stats["ratios"], stats["scores"]])
+        report = {
+            "faces_total": int(len(arr_a)),
+            "area_mean": float(np.mean(arr_a)),
+            "area_max": int(np.max(arr_a)),
+            "area_min": int(np.min(arr_a)),
+            "ratio_mean": float(np.mean(arr_r)),
+            "score_mean": float(np.mean(arr_s)),
+            "score_max": float(np.max(arr_s))
+        }
+    with open(p_out / "coords.json", "w", encoding="utf-8") as f:
+        json.dump(coords, f, ensure_ascii=False, indent=2)
+    with open(p_out / "report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    print("done ->", p_out)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--img_dir", required=True, help="folder with images")
+    ap.add_argument("--out_dir", default="faces", help="output folder")
+    ap.add_argument("--device", default=None, help="cpu or cuda (optional)")
+    ap.add_argument("--min_face", type=int, default=20, help="min face side length in pixels")
+    args = ap.parse_args()
+    run(args.img_dir, args.out_dir, args.device, args.min_face)
